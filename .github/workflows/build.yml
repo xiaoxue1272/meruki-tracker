@@ -1,0 +1,171 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"] # 只在推 v* tag 时构建并发布；普通 push / 手动触发都不构建产物。
+
+permissions:
+  actions: read # verify 要查这个 commit 的 CI 记录（GET .../actions/workflows/.../runs）
+  contents: write # release job 需要建 Release、传附件。
+# 注意：只要显式写了 permissions，没列出来的权限就都是 none。
+# 所以 actions: read 必须写上，否则 verify 里查 CI 记录会被 403 挡住。
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build 里不再跑测试。推 tag 前这个 commit 已经在分支上跑过 CI 了，
+  # 这里只校验「同一个 commit 有成功的 CI 记录」：既不重复跑三平台测试，
+  # 也不会出现 CI 红着还发 Release 的情况。
+  verify:
+    name: verify · ci 记录
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          URL="https://api.github.com/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=50"
+          deadline=$(( $(date +%s) + 600 ))
+
+          fetch() {
+            curl -sS --max-time 30 --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$URL"
+          }
+
+          while :; do
+            body=$(fetch) || { echo "✗ 读取 CI 记录失败"; exit 1; }
+            if [ "$(echo "$body" | jq -r 'has("workflow_runs")' 2>/dev/null)" != "true" ]; then
+              echo "✗ GitHub API 返回异常："
+              echo "$body" | head -20
+              exit 1
+            fi
+
+            ok=$(echo "$body" | jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
+            pending=$(echo "$body" | jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            failed=$(echo "$body" | jq '[.workflow_runs[] | select(.status == "completed" and .conclusion != "success")] | length')
+            echo "commit ${SHA:0:8}: success=$ok pending=$pending failed=$failed"
+
+            if [ "$ok" -gt 0 ]; then
+              echo "✓ 该 commit 有成功的 CI 记录，放行构建"
+              exit 0
+            fi
+            if [ "$pending" -gt 0 ]; then
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "✗ 等了 10 分钟 CI 还没跑完，先别打 tag"
+                exit 1
+              fi
+              sleep 20
+              continue
+            fi
+            if [ "$failed" -gt 0 ]; then
+              echo "✗ 该 commit 的 CI 没通过，不能构建"
+              exit 1
+            fi
+            echo "✗ 该 commit 没有任何 CI 记录——先推到分支让 CI 跑过，再打 tag"
+            exit 1
+          done
+
+  build:
+    name: build · ${{ matrix.os }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: meruki-tracker-linux
+          - os: macos-15 # Apple Silicon（arm64）；macos-14 镜像已于 2026-11-02 退役。
+            asset: meruki-tracker-macos-arm64
+          - os: windows-latest
+            asset: meruki-tracker-windows.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      # bash 在三个平台都可用（Windows 走 Git Bash），省去 pwsh/cmd 分支。
+      - name: PyInstaller onefile
+        shell: bash
+        run: |
+          uv run pyinstaller \
+            --noconfirm --onefile --clean \
+            --name meruki-tracker \
+            --collect-all tzdata \
+            --hidden-import cryptography \
+            --hidden-import httpx \
+            --hidden-import qrcode \
+            --hidden-import prompt_toolkit \
+            --hidden-import websockets \
+            --paths src \
+            scripts/build_entry.py
+
+      # 构建产物至少要能回答 --version；argparse 在 TTY 检查之前就处理，headless 可跑。
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          BIN="dist/meruki-tracker"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          "$BIN" --version
+
+      # 三个平台产出的可执行文件都叫 meruki-tracker，直接当附件会重名。
+      # 在构建阶段就改成最终发布名，附件名天然唯一，也不用依赖 action 的重命名语法。
+      - name: Rename to release asset name
+        shell: bash
+        run: |
+          BIN="dist/meruki-tracker"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          mv "$BIN" "dist/${{ matrix.asset }}"
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [verify, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # 每个 artifact 里就是那一个已改名的可执行文件，下载后位于 artifacts/<asset>/<asset>。
+      # 注意两点，都是踩过的坑：
+      # 1. softprops/action-gh-release@v3 的 files 只接受路径或 glob，不再支持
+      #    path#display_name 这种重命名写法（带 # 的整串会被当 glob，永远匹配不到）。
+      # 2. fail_on_unmatched_files 默认 false —— 匹配不到只会打一行 🤔 警告，
+      #    Release 照样建出来但一个附件都没有，job 还是绿的。必须显式打开才能炸出来。
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/meruki-tracker-linux/meruki-tracker-linux
+            artifacts/meruki-tracker-macos-arm64/meruki-tracker-macos-arm64
+            artifacts/meruki-tracker-windows.exe/meruki-tracker-windows.exe

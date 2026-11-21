@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+*.spec
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# 项目数据（Cookie / 快照 / 观测库——全部敏感）
+data/
+# 配置已改为存进 data/meruki.db 的 settings 表，不再有外部配置文件
+
+# 手工备份的库副本，同样含真实 Cookie
+.backup/
+
+# uv 的本地缓存
+.uvcache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
